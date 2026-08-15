@@ -33,7 +33,12 @@ from yfmcp.utils import create_error_response
 from yfmcp.utils import dump_json
 
 # https://github.com/jlowin/fastmcp/issues/81#issuecomment-2714245145
-mcp = FastMCP("yfinance_mcp", log_level="ERROR")
+mcp = FastMCP(
+    "yfinance_mcp",
+    log_level="ERROR",
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", "10000")),
+)
 
 
 _RETRYABLE_YFINANCE_EXCEPTIONS: tuple[type[Exception], ...] = (
