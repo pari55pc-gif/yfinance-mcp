@@ -1944,7 +1944,9 @@ async def get_holders(
 
     result["_metadata"] = {"max_rows": max_rows, "sections": section_metadata}
     return dump_json(result)
-    @mcp.tool(
+
+
+@mcp.tool(
     name="yfinance_backtest",
     annotations=ToolAnnotations(
         readOnlyHint=True,
