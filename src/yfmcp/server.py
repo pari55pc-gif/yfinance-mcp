@@ -1944,6 +1944,400 @@ async def get_holders(
 
     result["_metadata"] = {"max_rows": max_rows, "sections": section_metadata}
     return dump_json(result)
+    @mcp.tool(
+    name="yfinance_backtest",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+async def backtest(
+    symbol: Annotated[
+        str,
+        Field(description="Yahoo Finance symbol, e.g. SBIN.NS")
+    ],
+    period: Annotated[
+        str,
+        Field(description="Backtest period: 1y, 2y, 5y, 10y, max")
+    ] = "5y",
+    initial_capital: Annotated[
+        float,
+        Field(description="Starting capital", gt=0)
+    ] = 100000,
+    ema_fast: Annotated[
+        int,
+        Field(description="Fast EMA", gt=0)
+    ] = 21,
+    ema_slow: Annotated[
+        int,
+        Field(description="Slow EMA", gt=0)
+    ] = 55,
+    stop_loss_pct: Annotated[
+        float,
+        Field(description="Stop loss percentage", gt=0)
+    ] = 3.0,
+    target_pct: Annotated[
+        float,
+        Field(description="Target percentage", gt=0)
+    ] = 6.0,
+) -> str:
+    """
+    Backtest a simple daily swing strategy.
+
+    Entry:
+    - Close crosses above EMA fast
+    - EMA fast > EMA slow
+
+    Exit:
+    - Stop loss
+    - Target
+    - Close crosses below EMA fast
+
+    Uses daily OHLC data from Yahoo Finance.
+    """
+
+    try:
+        df = await asyncio.to_thread(
+            yf.download,
+            symbol,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            multi_level_index=False,
+        )
+
+        if df is None or df.empty:
+            return create_error_response(
+                f"No historical data available for '{symbol}'.",
+                error_code="NO_DATA",
+                details={"symbol": symbol, "period": period},
+            )
+
+        # Normalize columns
+        df = df.copy()
+
+        required = ["Open", "High", "Low", "Close"]
+        missing = [c for c in required if c not in df.columns]
+
+        if missing:
+            return create_error_response(
+                "Required OHLC columns are missing.",
+                error_code="NO_DATA",
+                details={"missing_columns": missing},
+            )
+
+        # Indicators
+        df["EMA_FAST"] = df["Close"].ewm(
+            span=ema_fast,
+            adjust=False
+        ).mean()
+
+        df["EMA_SLOW"] = df["Close"].ewm(
+            span=ema_slow,
+            adjust=False
+        ).mean()
+
+        capital = float(initial_capital)
+        equity = capital
+
+        position = 0
+        entry_price = 0.0
+        quantity = 0
+        entry_date = None
+
+        trades = []
+
+        equity_curve = []
+
+        for i in range(max(ema_slow, 2), len(df)):
+            row = df.iloc[i]
+
+            close = float(row["Close"])
+            high = float(row["High"])
+            low = float(row["Low"])
+
+            date = str(df.index[i].date())
+
+            # -------------------------
+            # ENTRY
+            # -------------------------
+            if position == 0:
+
+                previous_close = float(df["Close"].iloc[i - 1])
+                previous_fast = float(df["EMA_FAST"].iloc[i - 1])
+                current_fast = float(row["EMA_FAST"])
+                current_slow = float(row["EMA_SLOW"])
+
+                crossed_above = (
+                    previous_close <= previous_fast
+                    and close > current_fast
+                )
+
+                trend_ok = current_fast > current_slow
+
+                if crossed_above and trend_ok:
+
+                    entry_price = close
+
+                    stop_price = entry_price * (
+                        1 - stop_loss_pct / 100
+                    )
+
+                    target_price = entry_price * (
+                        1 + target_pct / 100
+                    )
+
+                    quantity = int(equity / entry_price)
+
+                    if quantity > 0:
+                        position = 1
+                        entry_date = date
+
+            # -------------------------
+            # EXIT
+            # -------------------------
+            elif position == 1:
+
+                stop_price = entry_price * (
+                    1 - stop_loss_pct / 100
+                )
+
+                target_price = entry_price * (
+                    1 + target_pct / 100
+                )
+
+                exit_price = None
+                exit_reason = None
+
+                # Conservative assumption:
+                # If both SL and target occur on same day,
+                # SL is assumed to hit first.
+                if low <= stop_price:
+                    exit_price = stop_price
+                    exit_reason = "STOP_LOSS"
+
+                elif high >= target_price:
+                    exit_price = target_price
+                    exit_reason = "TARGET"
+
+                elif close < float(row["EMA_FAST"]):
+                    exit_price = close
+                    exit_reason = "EMA_EXIT"
+
+                if exit_price is not None:
+
+                    pnl = (
+                        exit_price - entry_price
+                    ) * quantity
+
+                    pnl_pct = (
+                        (exit_price / entry_price) - 1
+                    ) * 100
+
+                    equity += pnl
+
+                    trades.append(
+                        {
+                            "entry_date": entry_date,
+                            "exit_date": date,
+                            "entry_price": round(entry_price, 2),
+                            "exit_price": round(exit_price, 2),
+                            "quantity": quantity,
+                            "pnl": round(pnl, 2),
+                            "pnl_pct": round(pnl_pct, 2),
+                            "exit_reason": exit_reason,
+                        }
+                    )
+
+                    position = 0
+                    entry_price = 0.0
+                    quantity = 0
+                    entry_date = None
+
+            equity_curve.append(equity)
+
+        # Close open position at last available close
+        if position == 1:
+
+            last_close = float(df["Close"].iloc[-1])
+            last_date = str(df.index[-1].date())
+
+            pnl = (
+                last_close - entry_price
+            ) * quantity
+
+            pnl_pct = (
+                (last_close / entry_price) - 1
+            ) * 100
+
+            equity += pnl
+
+            trades.append(
+                {
+                    "entry_date": entry_date,
+                    "exit_date": last_date,
+                    "entry_price": round(entry_price, 2),
+                    "exit_price": round(last_close, 2),
+                    "quantity": quantity,
+                    "pnl": round(pnl, 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "exit_reason": "END_OF_TEST",
+                }
+            )
+
+        # -------------------------
+        # PERFORMANCE
+        # -------------------------
+
+        total_trades = len(trades)
+
+        winning_trades = [
+            t for t in trades
+            if t["pnl"] > 0
+        ]
+
+        losing_trades = [
+            t for t in trades
+            if t["pnl"] <= 0
+        ]
+
+        wins = len(winning_trades)
+        losses = len(losing_trades)
+
+        win_rate = (
+            wins / total_trades * 100
+            if total_trades
+            else 0
+        )
+
+        total_pnl = equity - capital
+
+        total_return = (
+            total_pnl / capital * 100
+        )
+
+        gross_profit = sum(
+            t["pnl"] for t in winning_trades
+        )
+
+        gross_loss = abs(
+            sum(t["pnl"] for t in losing_trades)
+        )
+
+        profit_factor = (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else None
+        )
+
+        # Maximum drawdown
+        peak = capital
+        max_drawdown = 0.0
+
+        running_equity = capital
+
+        for trade in trades:
+
+            running_equity += trade["pnl"]
+
+            peak = max(
+                peak,
+                running_equity
+            )
+
+            drawdown = (
+                (running_equity - peak)
+                / peak
+                * 100
+            )
+
+            max_drawdown = min(
+                max_drawdown,
+                drawdown
+            )
+
+        avg_win = (
+            gross_profit / wins
+            if wins
+            else 0
+        )
+
+        avg_loss = (
+            gross_loss / losses
+            if losses
+            else 0
+        )
+
+        buy_hold_return = (
+            (
+                float(df["Close"].iloc[-1])
+                / float(df["Close"].iloc[0])
+            ) - 1
+        ) * 100
+
+        result = {
+            "backtest": {
+                "symbol": symbol,
+                "period": period,
+                "strategy": "EMA21/55 crossover swing strategy",
+                "initial_capital": round(capital, 2),
+                "final_capital": round(equity, 2),
+                "net_profit": round(total_pnl, 2),
+                "return_pct": round(total_return, 2),
+                "buy_hold_return_pct": round(
+                    buy_hold_return, 2
+                ),
+                "total_trades": total_trades,
+                "winning_trades": wins,
+                "losing_trades": losses,
+                "win_rate_pct": round(
+                    win_rate, 2
+                ),
+                "profit_factor": (
+                    round(profit_factor, 2)
+                    if profit_factor is not None
+                    else None
+                ),
+                "average_win": round(
+                    avg_win, 2
+                ),
+                "average_loss": round(
+                    avg_loss, 2
+                ),
+                "max_drawdown_pct": round(
+                    max_drawdown, 2
+                ),
+                "parameters": {
+                    "ema_fast": ema_fast,
+                    "ema_slow": ema_slow,
+                    "stop_loss_pct": stop_loss_pct,
+                    "target_pct": target_pct,
+                },
+            },
+            "trades": trades,
+        }
+
+        return dump_json(result)
+
+    except Exception as exc:
+
+        logger.exception(
+            "Backtest failed for {}",
+            symbol
+        )
+
+        return create_error_response(
+            f"Backtest failed for '{symbol}'.",
+            error_code="BACKTEST_ERROR",
+            details={
+                "symbol": symbol,
+                "period": period,
+                "exception": str(exc),
+            },
+        )
 
 
 def main() -> None:
