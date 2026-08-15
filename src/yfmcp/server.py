@@ -1958,7 +1958,7 @@ async def get_holders(
 async def backtest(
     symbol: Annotated[
         str,
-        Field(description="Yahoo Finance symbol, e.g. SBIN.NS")
+        Field(description="Yahoo Finance NSE symbol, e.g. SBIN.NS, RELIANCE.NS")
     ],
     period: Annotated[
         str,
@@ -1968,39 +1968,154 @@ async def backtest(
         float,
         Field(description="Starting capital", gt=0)
     ] = 100000,
-    ema_fast: Annotated[
-        int,
-        Field(description="Fast EMA", gt=0)
-    ] = 21,
-    ema_slow: Annotated[
-        int,
-        Field(description="Slow EMA", gt=0)
-    ] = 55,
-    stop_loss_pct: Annotated[
-        float,
-        Field(description="Stop loss percentage", gt=0)
-    ] = 3.0,
-    target_pct: Annotated[
-        float,
-        Field(description="Target percentage", gt=0)
-    ] = 6.0,
 ) -> str:
     """
-    Backtest a simple daily swing strategy.
+    FINAL LOCKED SWING / POSITIONAL STRATEGY
 
-    Entry:
-    - Close crosses above EMA fast
-    - EMA fast > EMA slow
+    ==============================================================
+    STRATEGY PURPOSE
+    ==============================================================
 
-    Exit:
-    - Stop loss
-    - Target
-    - Close crosses below EMA fast
+    Primary style:
+        Swing + positional
 
-    Uses daily OHLC data from Yahoo Finance.
+    Holding period:
+        2 to 15 trading days
+
+    Main timeframe:
+        Weekly trend + Daily setup
+
+    Strategy is intentionally NOT intraday.
+
+    ==============================================================
+
+    HARD STRATEGY RULES
+    ==============================================================
+
+    WEEKLY STRUCTURE
+        Weekly Close > Weekly EMA21
+        Weekly EMA21 > Weekly EMA55
+
+    DAILY STRUCTURE
+        Close > EMA21 > EMA55 > EMA100 > EMA200
+
+    MOMENTUM
+        RSI 50 - 70
+        MACD > Signal
+        MACD Histogram > 0
+        ADX >= 20
+
+    VOLUME
+        Current Volume >= 20-day Average Volume
+
+    ENTRY
+        Either:
+
+        A) 20-day breakout
+
+        OR
+
+        B) Pullback + EMA21 reclaim:
+           Previous Close <= Previous EMA21
+           Current Close > EMA21
+           Current Close > Previous High
+
+    NO CHASING
+        Close must not be more than 5% above EMA21.
+
+    EXECUTION
+        Signal confirmed at today's close.
+        Entry = next trading day's OPEN.
+
+    STOP LOSS
+        1.5 x ATR(14)
+
+    TARGET
+        2R
+
+    POSITION SIZING
+        Maximum 1% of current equity risk per trade.
+
+    EXIT
+        1. ATR stop
+        2. 2R target
+        3. Daily close below EMA21
+        4. Maximum 15 trading days
+        5. End of test
+
+    ==============================================================
+
+    IMPORTANT
+    ==============================================================
+
+    This backtest uses equity OHLCV data.
+
+    It does NOT fake:
+        - F&O OI
+        - CE/PE liquidity
+        - institutional flow
+        - sector heatmap
+        - live option liquidity
+
+    Those are scanner-stage filters.
+
+    The backtest therefore tests the PRICE/ACTION core strategy
+    honestly instead of inventing unavailable historical data.
+
+    No look-ahead:
+        Weekly confirmation uses only the previous completed
+        weekly candle.
+
+        Daily signal enters on the next day's OPEN.
     """
 
     try:
+        import numpy as np
+        import pandas as pd
+
+        # ==========================================================
+        # LOCKED STRATEGY CONFIGURATION
+        # DO NOT CHANGE THESE FOR INDIVIDUAL TESTS
+        # ==========================================================
+
+        EMA_FAST = 21
+        EMA_MID = 55
+        EMA_LONG = 100
+        EMA_TREND = 200
+
+        RSI_PERIOD = 14
+        RSI_MIN = 50.0
+        RSI_MAX = 70.0
+
+        MACD_FAST = 12
+        MACD_SLOW = 26
+        MACD_SIGNAL = 9
+
+        ATR_PERIOD = 14
+        ATR_MULTIPLIER = 1.5
+
+        ADX_PERIOD = 14
+        MIN_ADX = 20.0
+
+        VOLUME_PERIOD = 20
+        MIN_VOLUME_RATIO = 1.0
+
+        BREAKOUT_PERIOD = 20
+
+        MAX_EXTENSION_PCT = 5.0
+
+        RISK_PER_TRADE_PCT = 1.0
+
+        REWARD_RISK = 2.0
+
+        MAX_HOLDING_DAYS = 15
+
+        MIN_REQUIRED_BARS = 300
+
+        # ==========================================================
+        # DOWNLOAD DAILY DATA
+        # ==========================================================
+
         df = await asyncio.to_thread(
             yf.download,
             symbol,
@@ -2015,311 +2130,1400 @@ async def backtest(
             return create_error_response(
                 f"No historical data available for '{symbol}'.",
                 error_code="NO_DATA",
-                details={"symbol": symbol, "period": period},
+                details={
+                    "symbol": symbol,
+                    "period": period,
+                },
             )
 
-        # Normalize columns
         df = df.copy()
 
-        required = ["Open", "High", "Low", "Close"]
-        missing = [c for c in required if c not in df.columns]
+        required_columns = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]
+
+        missing = [
+            column
+            for column in required_columns
+            if column not in df.columns
+        ]
 
         if missing:
             return create_error_response(
-                "Required OHLC columns are missing.",
+                "Required OHLCV columns are missing.",
                 error_code="NO_DATA",
-                details={"missing_columns": missing},
+                details={
+                    "symbol": symbol,
+                    "missing_columns": missing,
+                },
             )
 
-        # Indicators
-        df["EMA_FAST"] = df["Close"].ewm(
-            span=ema_fast,
-            adjust=False
+        df = df[required_columns].copy()
+
+        for column in required_columns:
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+
+        df = df.dropna()
+
+        if len(df) < MIN_REQUIRED_BARS:
+            return create_error_response(
+                f"Insufficient historical data for '{symbol}'. "
+                f"At least {MIN_REQUIRED_BARS} daily candles are required.",
+                error_code="NO_DATA",
+                details={
+                    "symbol": symbol,
+                    "available_bars": len(df),
+                    "required_bars": MIN_REQUIRED_BARS,
+                },
+            )
+
+        # ==========================================================
+        # DAILY EMA STRUCTURE
+        # ==========================================================
+
+        close = df["Close"]
+
+        df["EMA21"] = close.ewm(
+            span=EMA_FAST,
+            adjust=False,
         ).mean()
 
-        df["EMA_SLOW"] = df["Close"].ewm(
-            span=ema_slow,
-            adjust=False
+        df["EMA55"] = close.ewm(
+            span=EMA_MID,
+            adjust=False,
         ).mean()
 
-        capital = float(initial_capital)
+        df["EMA100"] = close.ewm(
+            span=EMA_LONG,
+            adjust=False,
+        ).mean()
+
+        df["EMA200"] = close.ewm(
+            span=EMA_TREND,
+            adjust=False,
+        ).mean()
+
+        # ==========================================================
+        # RSI 14
+        # ==========================================================
+
+        delta = close.diff()
+
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+
+        avg_gain = gain.ewm(
+            alpha=1 / RSI_PERIOD,
+            adjust=False,
+        ).mean()
+
+        avg_loss = loss.ewm(
+            alpha=1 / RSI_PERIOD,
+            adjust=False,
+        ).mean()
+
+        rs = avg_gain / avg_loss.replace(
+            0,
+            np.nan,
+        )
+
+        df["RSI"] = (
+            100 -
+            (
+                100 /
+                (1 + rs)
+            )
+        )
+
+        # ==========================================================
+        # MACD
+        # ==========================================================
+
+        ema12 = close.ewm(
+            span=MACD_FAST,
+            adjust=False,
+        ).mean()
+
+        ema26 = close.ewm(
+            span=MACD_SLOW,
+            adjust=False,
+        ).mean()
+
+        df["MACD"] = ema12 - ema26
+
+        df["MACD_SIGNAL"] = df["MACD"].ewm(
+            span=MACD_SIGNAL,
+            adjust=False,
+        ).mean()
+
+        df["MACD_HIST"] = (
+            df["MACD"] -
+            df["MACD_SIGNAL"]
+        )
+
+        # ==========================================================
+        # ATR 14
+        # ==========================================================
+
+        previous_close = close.shift(1)
+
+        tr1 = (
+            df["High"] -
+            df["Low"]
+        )
+
+        tr2 = (
+            df["High"] -
+            previous_close
+        ).abs()
+
+        tr3 = (
+            df["Low"] -
+            previous_close
+        ).abs()
+
+        true_range = pd.concat(
+            [
+                tr1,
+                tr2,
+                tr3,
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        df["ATR14"] = true_range.ewm(
+            alpha=1 / ATR_PERIOD,
+            adjust=False,
+        ).mean()
+
+        # ==========================================================
+        # ADX 14
+        # ==========================================================
+
+        up_move = (
+            df["High"] -
+            df["High"].shift(1)
+        )
+
+        down_move = (
+            df["Low"].shift(1) -
+            df["Low"]
+        )
+
+        plus_dm = pd.Series(
+            np.where(
+                (up_move > down_move) &
+                (up_move > 0),
+                up_move,
+                0.0,
+            ),
+            index=df.index,
+        )
+
+        minus_dm = pd.Series(
+            np.where(
+                (down_move > up_move) &
+                (down_move > 0),
+                down_move,
+                0.0,
+            ),
+            index=df.index,
+        )
+
+        atr = df["ATR14"]
+
+        plus_di = (
+            100 *
+            plus_dm.ewm(
+                alpha=1 / ADX_PERIOD,
+                adjust=False,
+            ).mean() /
+            atr.replace(
+                0,
+                np.nan,
+            )
+        )
+
+        minus_di = (
+            100 *
+            minus_dm.ewm(
+                alpha=1 / ADX_PERIOD,
+                adjust=False,
+            ).mean() /
+            atr.replace(
+                0,
+                np.nan,
+            )
+        )
+
+        di_sum = (
+            plus_di +
+            minus_di
+        ).replace(
+            0,
+            np.nan,
+        )
+
+        dx = (
+            100 *
+            (
+                plus_di -
+                minus_di
+            ).abs() /
+            di_sum
+        )
+
+        df["ADX"] = dx.ewm(
+            alpha=1 / ADX_PERIOD,
+            adjust=False,
+        ).mean()
+
+        # ==========================================================
+        # VOLUME
+        # ==========================================================
+
+        df["VOL_AVG20"] = (
+            df["Volume"]
+            .rolling(VOLUME_PERIOD)
+            .mean()
+        )
+
+        df["VOLUME_RATIO"] = (
+            df["Volume"] /
+            df["VOL_AVG20"]
+        )
+
+        # ==========================================================
+        # PREVIOUS 20-DAY HIGH
+        # IMPORTANT:
+        # shift FIRST, then rolling
+        # so today's candle cannot be part of breakout level.
+        # ==========================================================
+
+        df["PREV20_HIGH"] = (
+            df["High"]
+            .shift(1)
+            .rolling(BREAKOUT_PERIOD)
+            .max()
+        )
+
+        # ==========================================================
+        # WEEKLY DATA
+        # ==========================================================
+
+        weekly = df[
+            [
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume",
+            ]
+        ].resample(
+            "W-FRI"
+        ).agg(
+            {
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+            }
+        ).dropna()
+
+        weekly["EMA21"] = weekly["Close"].ewm(
+            span=21,
+            adjust=False,
+        ).mean()
+
+        weekly["EMA55"] = weekly["Close"].ewm(
+            span=55,
+            adjust=False,
+        ).mean()
+
+        # ----------------------------------------------------------
+        # USE PREVIOUS COMPLETED WEEK ONLY
+        # ----------------------------------------------------------
+
+        weekly_confirmed = weekly[
+            [
+                "Close",
+                "EMA21",
+                "EMA55",
+            ]
+        ].shift(1)
+
+        weekly_confirmed = weekly_confirmed.rename(
+            columns={
+                "Close": "W_CLOSE",
+                "EMA21": "W_EMA21",
+                "EMA55": "W_EMA55",
+            }
+        )
+
+        # ----------------------------------------------------------
+        # Map weekly values to daily data.
+        # Forward fill means Monday-Friday uses the last
+        # completed weekly candle.
+        # ----------------------------------------------------------
+
+        df = df.join(
+            weekly_confirmed,
+            how="left",
+        )
+
+        df[
+            [
+                "W_CLOSE",
+                "W_EMA21",
+                "W_EMA55",
+            ]
+        ] = df[
+            [
+                "W_CLOSE",
+                "W_EMA21",
+                "W_EMA55",
+            ]
+        ].ffill()
+
+        # ==========================================================
+        # CAPITAL
+        # ==========================================================
+
+        capital = float(
+            initial_capital
+        )
+
         equity = capital
 
-        position = 0
+        # ==========================================================
+        # POSITION STATE
+        # ==========================================================
+
+        position = False
+
         entry_price = 0.0
+        stop_price = 0.0
+        target_price = 0.0
+
         quantity = 0
+
         entry_date = None
+        entry_index = None
+
+        initial_risk_per_share = 0.0
 
         trades = []
 
         equity_curve = []
 
-        for i in range(max(ema_slow, 2), len(df)):
+        # ==========================================================
+        # BACKTEST
+        # ==========================================================
+
+        for i in range(
+            MIN_REQUIRED_BARS,
+            len(df) - 1,
+        ):
+
             row = df.iloc[i]
 
-            close = float(row["Close"])
-            high = float(row["High"])
-            low = float(row["Low"])
+            current_date = df.index[i]
 
-            date = str(df.index[i].date())
+            current_close = float(
+                row["Close"]
+            )
 
-            # -------------------------
-            # ENTRY
-            # -------------------------
-            if position == 0:
+            current_high = float(
+                row["High"]
+            )
 
-                previous_close = float(df["Close"].iloc[i - 1])
-                previous_fast = float(df["EMA_FAST"].iloc[i - 1])
-                current_fast = float(row["EMA_FAST"])
-                current_slow = float(row["EMA_SLOW"])
+            current_low = float(
+                row["Low"]
+            )
 
-                crossed_above = (
-                    previous_close <= previous_fast
-                    and close > current_fast
-                )
+            # ======================================================
+            # EXIT LOGIC
+            # ======================================================
 
-                trend_ok = current_fast > current_slow
+            if position:
 
-                if crossed_above and trend_ok:
-
-                    entry_price = close
-
-                    stop_price = entry_price * (
-                        1 - stop_loss_pct / 100
-                    )
-
-                    target_price = entry_price * (
-                        1 + target_pct / 100
-                    )
-
-                    quantity = int(equity / entry_price)
-
-                    if quantity > 0:
-                        position = 1
-                        entry_date = date
-
-            # -------------------------
-            # EXIT
-            # -------------------------
-            elif position == 1:
-
-                stop_price = entry_price * (
-                    1 - stop_loss_pct / 100
-                )
-
-                target_price = entry_price * (
-                    1 + target_pct / 100
+                holding_days = (
+                    i -
+                    entry_index
                 )
 
                 exit_price = None
                 exit_reason = None
 
-                # Conservative assumption:
-                # If both SL and target occur on same day,
-                # SL is assumed to hit first.
-                if low <= stop_price:
+                # --------------------------------------------------
+                # STOP LOSS
+                # --------------------------------------------------
+
+                if current_low <= stop_price:
+
                     exit_price = stop_price
-                    exit_reason = "STOP_LOSS"
+                    exit_reason = "ATR_STOP"
 
-                elif high >= target_price:
+                # --------------------------------------------------
+                # TARGET
+                # --------------------------------------------------
+
+                elif current_high >= target_price:
+
                     exit_price = target_price
-                    exit_reason = "TARGET"
+                    exit_reason = "TARGET_2R"
 
-                elif close < float(row["EMA_FAST"]):
-                    exit_price = close
-                    exit_reason = "EMA_EXIT"
+                # --------------------------------------------------
+                # MAX HOLD
+                # --------------------------------------------------
+
+                elif holding_days >= MAX_HOLDING_DAYS:
+
+                    exit_price = current_close
+                    exit_reason = "MAX_HOLD"
+
+                # --------------------------------------------------
+                # TREND FAILURE
+                # --------------------------------------------------
+
+                elif current_close < float(
+                    row["EMA21"]
+                ):
+
+                    exit_price = current_close
+                    exit_reason = "EMA21_EXIT"
+
+                # --------------------------------------------------
+                # EXECUTE EXIT
+                # --------------------------------------------------
 
                 if exit_price is not None:
 
                     pnl = (
-                        exit_price - entry_price
+                        exit_price -
+                        entry_price
                     ) * quantity
 
                     pnl_pct = (
-                        (exit_price / entry_price) - 1
+                        (
+                            exit_price /
+                            entry_price
+                        ) - 1
                     ) * 100
+
+                    initial_risk = (
+                        initial_risk_per_share *
+                        quantity
+                    )
+
+                    realized_r = (
+                        pnl /
+                        initial_risk
+                        if initial_risk > 0
+                        else None
+                    )
 
                     equity += pnl
 
                     trades.append(
                         {
-                            "entry_date": entry_date,
-                            "exit_date": date,
-                            "entry_price": round(entry_price, 2),
-                            "exit_price": round(exit_price, 2),
-                            "quantity": quantity,
-                            "pnl": round(pnl, 2),
-                            "pnl_pct": round(pnl_pct, 2),
+                            "entry_date": str(
+                                entry_date.date()
+                            ),
+                            "exit_date": str(
+                                current_date.date()
+                            ),
+                            "holding_days": int(
+                                holding_days
+                            ),
+                            "entry_price": round(
+                                entry_price,
+                                2,
+                            ),
+                            "exit_price": round(
+                                exit_price,
+                                2,
+                            ),
+                            "quantity": int(
+                                quantity
+                            ),
+                            "initial_risk_per_share": round(
+                                initial_risk_per_share,
+                                2,
+                            ),
+                            "pnl": round(
+                                pnl,
+                                2,
+                            ),
+                            "pnl_pct": round(
+                                pnl_pct,
+                                2,
+                            ),
+                            "realized_R": round(
+                                realized_r,
+                                2,
+                            ) if realized_r is not None else None,
                             "exit_reason": exit_reason,
                         }
                     )
 
-                    position = 0
+                    position = False
+
                     entry_price = 0.0
+                    stop_price = 0.0
+                    target_price = 0.0
                     quantity = 0
+
                     entry_date = None
+                    entry_index = None
 
-            equity_curve.append(equity)
+                    initial_risk_per_share = 0.0
 
-        # Close open position at last available close
-        if position == 1:
+            # ======================================================
+            # ENTRY LOGIC
+            # ======================================================
 
-            last_close = float(df["Close"].iloc[-1])
-            last_date = str(df.index[-1].date())
+            if not position:
+
+                # --------------------------------------------------
+                # WEEKLY TREND
+                # --------------------------------------------------
+
+                weekly_trend = (
+                    pd.notna(row["W_CLOSE"])
+                    and
+                    pd.notna(row["W_EMA21"])
+                    and
+                    pd.notna(row["W_EMA55"])
+                    and
+                    float(row["W_CLOSE"]) >
+                    float(row["W_EMA21"])
+                    and
+                    float(row["W_EMA21"]) >
+                    float(row["W_EMA55"])
+                )
+
+                # --------------------------------------------------
+                # DAILY EMA STRUCTURE
+                # --------------------------------------------------
+
+                daily_structure = (
+                    current_close >
+                    float(row["EMA21"])
+                    >
+                    float(row["EMA55"])
+                    >
+                    float(row["EMA100"])
+                    >
+                    float(row["EMA200"])
+                )
+
+                # --------------------------------------------------
+                # RSI
+                # --------------------------------------------------
+
+                rsi = float(
+                    row["RSI"]
+                )
+
+                rsi_ok = (
+                    RSI_MIN <= rsi <= RSI_MAX
+                )
+
+                # --------------------------------------------------
+                # MACD
+                # --------------------------------------------------
+
+                macd_ok = (
+                    float(row["MACD"]) >
+                    float(row["MACD_SIGNAL"])
+                    and
+                    float(row["MACD_HIST"]) >
+                    0
+                )
+
+                # --------------------------------------------------
+                # ADX
+                # --------------------------------------------------
+
+                adx = float(
+                    row["ADX"]
+                )
+
+                adx_ok = (
+                    adx >= MIN_ADX
+                )
+
+                # --------------------------------------------------
+                # VOLUME
+                # --------------------------------------------------
+
+                volume_ratio = float(
+                    row["VOLUME_RATIO"]
+                )
+
+                volume_ok = (
+                    volume_ratio >=
+                    MIN_VOLUME_RATIO
+                )
+
+                # --------------------------------------------------
+                # NO CHASING
+                # --------------------------------------------------
+
+                extension_pct = (
+                    (
+                        current_close /
+                        float(row["EMA21"])
+                    ) - 1
+                ) * 100
+
+                not_extended = (
+                    extension_pct <=
+                    MAX_EXTENSION_PCT
+                )
+
+                # --------------------------------------------------
+                # BREAKOUT
+                # --------------------------------------------------
+
+                breakout = (
+                    pd.notna(row["PREV20_HIGH"])
+                    and
+                    current_close >
+                    float(row["PREV20_HIGH"])
+                )
+
+                # --------------------------------------------------
+                # PULLBACK RECLAIM
+                # --------------------------------------------------
+
+                previous_close = float(
+                    df["Close"].iloc[i - 1]
+                )
+
+                previous_ema21 = float(
+                    df["EMA21"].iloc[i - 1]
+                )
+
+                previous_high = float(
+                    df["High"].iloc[i - 1]
+                )
+
+                pullback_reclaim = (
+                    previous_close <=
+                    previous_ema21
+                    and
+                    current_close >
+                    float(row["EMA21"])
+                    and
+                    current_close >
+                    previous_high
+                )
+
+                trigger = (
+                    breakout or
+                    pullback_reclaim
+                )
+
+                # --------------------------------------------------
+                # FINAL SIGNAL
+                # --------------------------------------------------
+
+                signal = (
+                    weekly_trend
+                    and
+                    daily_structure
+                    and
+                    rsi_ok
+                    and
+                    macd_ok
+                    and
+                    adx_ok
+                    and
+                    volume_ok
+                    and
+                    not_extended
+                    and
+                    trigger
+                )
+
+                if signal:
+
+                    # ==================================================
+                    # NEXT DAY OPEN = ACTUAL ENTRY
+                    # ==================================================
+
+                    next_row = df.iloc[i + 1]
+
+                    next_open = float(
+                        next_row["Open"]
+                    )
+
+                    atr = float(
+                        row["ATR14"]
+                    )
+
+                    if (
+                        not np.isfinite(atr)
+                        or
+                        atr <= 0
+                    ):
+                        continue
+
+                    # ==================================================
+                    # ATR STOP
+                    # ==================================================
+
+                    risk_per_share = (
+                        ATR_MULTIPLIER *
+                        atr
+                    )
+
+                    stop = (
+                        next_open -
+                        risk_per_share
+                    )
+
+                    # ==================================================
+                    # 2R TARGET
+                    # ==================================================
+
+                    target = (
+                        next_open +
+                        (
+                            risk_per_share *
+                            REWARD_RISK
+                        )
+                    )
+
+                    # ==================================================
+                    # 1% CAPITAL RISK
+                    # ==================================================
+
+                    allowed_risk = (
+                        equity *
+                        RISK_PER_TRADE_PCT /
+                        100
+                    )
+
+                    quantity_by_risk = int(
+                        allowed_risk /
+                        risk_per_share
+                    )
+
+                    quantity_by_capital = int(
+                        equity /
+                        next_open
+                    )
+
+                    quantity = min(
+                        quantity_by_risk,
+                        quantity_by_capital,
+                    )
+
+                    if quantity <= 0:
+                        continue
+
+                    # ==================================================
+                    # OPEN POSITION
+                    # ==================================================
+
+                    position = True
+
+                    entry_price = next_open
+
+                    stop_price = stop
+
+                    target_price = target
+
+                    quantity = quantity
+
+                    entry_date = df.index[
+                        i + 1
+                    ]
+
+                    entry_index = i + 1
+
+                    initial_risk_per_share = (
+                        risk_per_share
+                    )
+
+            # ======================================================
+            # EQUITY CURVE
+            # ======================================================
+
+            equity_curve.append(
+                {
+                    "date": str(
+                        current_date.date()
+                    ),
+                    "equity": round(
+                        equity,
+                        2,
+                    ),
+                }
+            )
+
+        # ==========================================================
+        # CLOSE OPEN POSITION AT END OF TEST
+        # ==========================================================
+
+        if position:
+
+            last_close = float(
+                df["Close"].iloc[-1]
+            )
+
+            last_date = df.index[-1]
+
+            holding_days = (
+                len(df) -
+                1 -
+                entry_index
+            )
 
             pnl = (
-                last_close - entry_price
+                last_close -
+                entry_price
             ) * quantity
 
             pnl_pct = (
-                (last_close / entry_price) - 1
+                (
+                    last_close /
+                    entry_price
+                ) - 1
             ) * 100
+
+            initial_risk = (
+                initial_risk_per_share *
+                quantity
+            )
+
+            realized_r = (
+                pnl /
+                initial_risk
+                if initial_risk > 0
+                else None
+            )
 
             equity += pnl
 
             trades.append(
                 {
-                    "entry_date": entry_date,
-                    "exit_date": last_date,
-                    "entry_price": round(entry_price, 2),
-                    "exit_price": round(last_close, 2),
-                    "quantity": quantity,
-                    "pnl": round(pnl, 2),
-                    "pnl_pct": round(pnl_pct, 2),
+                    "entry_date": str(
+                        entry_date.date()
+                    ),
+                    "exit_date": str(
+                        last_date.date()
+                    ),
+                    "holding_days": int(
+                        holding_days
+                    ),
+                    "entry_price": round(
+                        entry_price,
+                        2,
+                    ),
+                    "exit_price": round(
+                        last_close,
+                        2,
+                    ),
+                    "quantity": int(
+                        quantity
+                    ),
+                    "initial_risk_per_share": round(
+                        initial_risk_per_share,
+                        2,
+                    ),
+                    "pnl": round(
+                        pnl,
+                        2,
+                    ),
+                    "pnl_pct": round(
+                        pnl_pct,
+                        2,
+                    ),
+                    "realized_R": round(
+                        realized_r,
+                        2,
+                    ) if realized_r is not None else None,
                     "exit_reason": "END_OF_TEST",
                 }
             )
 
-        # -------------------------
+        # ==========================================================
         # PERFORMANCE
-        # -------------------------
+        # ==========================================================
 
-        total_trades = len(trades)
+        total_trades = len(
+            trades
+        )
 
-        winning_trades = [
-            t for t in trades
-            if t["pnl"] > 0
+        winners = [
+            trade
+            for trade in trades
+            if trade["pnl"] > 0
         ]
 
-        losing_trades = [
-            t for t in trades
-            if t["pnl"] <= 0
+        losers = [
+            trade
+            for trade in trades
+            if trade["pnl"] <= 0
         ]
 
-        wins = len(winning_trades)
-        losses = len(losing_trades)
+        wins = len(winners)
+        losses = len(losers)
 
         win_rate = (
-            wins / total_trades * 100
-            if total_trades
+            wins /
+            total_trades *
+            100
+            if total_trades > 0
             else 0
         )
 
-        total_pnl = equity - capital
+        net_profit = (
+            equity -
+            capital
+        )
 
-        total_return = (
-            total_pnl / capital * 100
+        return_pct = (
+            net_profit /
+            capital *
+            100
         )
 
         gross_profit = sum(
-            t["pnl"] for t in winning_trades
+            trade["pnl"]
+            for trade in winners
         )
 
         gross_loss = abs(
-            sum(t["pnl"] for t in losing_trades)
+            sum(
+                trade["pnl"]
+                for trade in losers
+            )
         )
 
         profit_factor = (
-            gross_profit / gross_loss
+            gross_profit /
+            gross_loss
             if gross_loss > 0
             else None
         )
 
-        # Maximum drawdown
-        peak = capital
-        max_drawdown = 0.0
-
-        running_equity = capital
-
-        for trade in trades:
-
-            running_equity += trade["pnl"]
-
-            peak = max(
-                peak,
-                running_equity
-            )
-
-            drawdown = (
-                (running_equity - peak)
-                / peak
-                * 100
-            )
-
-            max_drawdown = min(
-                max_drawdown,
-                drawdown
-            )
-
-        avg_win = (
-            gross_profit / wins
-            if wins
+        average_win = (
+            gross_profit /
+            wins
+            if wins > 0
             else 0
         )
 
-        avg_loss = (
-            gross_loss / losses
-            if losses
+        average_loss = (
+            gross_loss /
+            losses
+            if losses > 0
             else 0
+        )
+
+        average_holding_days = (
+            sum(
+                trade["holding_days"]
+                for trade in trades
+            ) /
+            total_trades
+            if total_trades > 0
+            else 0
+        )
+
+        # ==========================================================
+        # MAX DRAWDOWN
+        # ==========================================================
+
+        running_equity = capital
+        peak_equity = capital
+        max_drawdown_pct = 0.0
+
+        for trade in trades:
+
+            running_equity += (
+                trade["pnl"]
+            )
+
+            peak_equity = max(
+                peak_equity,
+                running_equity,
+            )
+
+            if peak_equity > 0:
+
+                drawdown = (
+                    (
+                        running_equity -
+                        peak_equity
+                    ) /
+                    peak_equity
+                ) * 100
+
+                max_drawdown_pct = min(
+                    max_drawdown_pct,
+                    drawdown,
+                )
+
+        # ==========================================================
+        # BUY & HOLD
+        # ==========================================================
+
+        first_close = float(
+            df["Close"].iloc[0]
+        )
+
+        final_close = float(
+            df["Close"].iloc[-1]
         )
 
         buy_hold_return = (
             (
-                float(df["Close"].iloc[-1])
-                / float(df["Close"].iloc[0])
+                final_close /
+                first_close
             ) - 1
         ) * 100
 
+        alpha = (
+            return_pct -
+            buy_hold_return
+        )
+
+        # ==========================================================
+        # EXIT BREAKDOWN
+        # ==========================================================
+
+        target_exits = sum(
+            1
+            for trade in trades
+            if trade["exit_reason"] ==
+            "TARGET_2R"
+        )
+
+        stop_exits = sum(
+            1
+            for trade in trades
+            if trade["exit_reason"] ==
+            "ATR_STOP"
+        )
+
+        ema_exits = sum(
+            1
+            for trade in trades
+            if trade["exit_reason"] ==
+            "EMA21_EXIT"
+        )
+
+        max_hold_exits = sum(
+            1
+            for trade in trades
+            if trade["exit_reason"] ==
+            "MAX_HOLD"
+        )
+
+        # ==========================================================
+        # BEST / WORST TRADE
+        # ==========================================================
+
+        best_trade = (
+            max(
+                trades,
+                key=lambda x: x["pnl"]
+            )
+            if trades
+            else None
+        )
+
+        worst_trade = (
+            min(
+                trades,
+                key=lambda x: x["pnl"]
+            )
+            if trades
+            else None
+        )
+
+        # ==========================================================
+        # FINAL RESULT
+        # ==========================================================
+
         result = {
+
             "backtest": {
+
+                "status": "COMPLETED",
+
                 "symbol": symbol,
+
                 "period": period,
-                "strategy": "EMA21/55 crossover swing strategy",
-                "initial_capital": round(capital, 2),
-                "final_capital": round(equity, 2),
-                "net_profit": round(total_pnl, 2),
-                "return_pct": round(total_return, 2),
+
+                "strategy_name": (
+                    "FINAL LOCKED "
+                    "MULTI-FACTOR SWING/POSITIONAL"
+                ),
+
+                "timeframe": (
+                    "Weekly trend + Daily setup"
+                ),
+
+                "style": (
+                    "Swing / Positional only"
+                ),
+
+                "initial_capital": round(
+                    capital,
+                    2,
+                ),
+
+                "final_capital": round(
+                    equity,
+                    2,
+                ),
+
+                "net_profit": round(
+                    net_profit,
+                    2,
+                ),
+
+                "return_pct": round(
+                    return_pct,
+                    2,
+                ),
+
                 "buy_hold_return_pct": round(
-                    buy_hold_return, 2
+                    buy_hold_return,
+                    2,
                 ),
-                "total_trades": total_trades,
-                "winning_trades": wins,
-                "losing_trades": losses,
+
+                "alpha_vs_buy_hold_pct": round(
+                    alpha,
+                    2,
+                ),
+
+                "total_trades": (
+                    total_trades
+                ),
+
+                "winning_trades": (
+                    wins
+                ),
+
+                "losing_trades": (
+                    losses
+                ),
+
                 "win_rate_pct": round(
-                    win_rate, 2
+                    win_rate,
+                    2,
                 ),
+
                 "profit_factor": (
-                    round(profit_factor, 2)
+                    round(
+                        profit_factor,
+                        2,
+                    )
                     if profit_factor is not None
                     else None
                 ),
+
                 "average_win": round(
-                    avg_win, 2
+                    average_win,
+                    2,
                 ),
+
                 "average_loss": round(
-                    avg_loss, 2
+                    average_loss,
+                    2,
                 ),
+
+                "average_holding_days": round(
+                    average_holding_days,
+                    2,
+                ),
+
                 "max_drawdown_pct": round(
-                    max_drawdown, 2
+                    max_drawdown_pct,
+                    2,
                 ),
-                "parameters": {
-                    "ema_fast": ema_fast,
-                    "ema_slow": ema_slow,
-                    "stop_loss_pct": stop_loss_pct,
-                    "target_pct": target_pct,
+
+                "best_trade": best_trade,
+
+                "worst_trade": worst_trade,
+
+                "exit_breakdown": {
+
+                    "TARGET_2R": (
+                        target_exits
+                    ),
+
+                    "ATR_STOP": (
+                        stop_exits
+                    ),
+
+                    "EMA21_EXIT": (
+                        ema_exits
+                    ),
+
+                    "MAX_HOLD": (
+                        max_hold_exits
+                    ),
+                },
+
+                "LOCKED_RULES": {
+
+                    "weekly": (
+                        "Weekly Close > Weekly EMA21 "
+                        "> Weekly EMA55"
+                    ),
+
+                    "daily_structure": (
+                        "Close > EMA21 > EMA55 "
+                        "> EMA100 > EMA200"
+                    ),
+
+                    "rsi": (
+                        "RSI 50-70"
+                    ),
+
+                    "macd": (
+                        "MACD > Signal AND "
+                        "Histogram > 0"
+                    ),
+
+                    "adx": (
+                        "ADX >= 20"
+                    ),
+
+                    "volume": (
+                        "Volume >= 20-day average"
+                    ),
+
+                    "entry_trigger": (
+                        "20-day breakout OR "
+                        "pullback reclaim"
+                    ),
+
+                    "no_chasing": (
+                        "Close <= 5% above EMA21"
+                    ),
+
+                    "entry_execution": (
+                        "Next trading day OPEN"
+                    ),
+
+                    "stop_loss": (
+                        "1.5 x ATR14"
+                    ),
+
+                    "target": (
+                        "2R"
+                    ),
+
+                    "risk_per_trade": (
+                        "1% of current equity"
+                    ),
+
+                    "maximum_holding": (
+                        "15 trading days"
+                    ),
+
+                    "exit": (
+                        "ATR Stop / 2R Target / "
+                        "EMA21 / Max Hold"
+                    ),
+                },
+
+                "data_integrity": {
+
+                    "look_ahead_bias": (
+                        "AVOIDED"
+                    ),
+
+                    "weekly_confirmation": (
+                        "Previous completed week"
+                    ),
+
+                    "entry_price": (
+                        "Next trading day Open"
+                    ),
+
+                    "intraday_execution": (
+                        "NOT USED"
+                    ),
+
+                    "options_OI": (
+                        "NOT USED IN BACKTEST"
+                    ),
+
+                    "options_liquidity": (
+                        "NOT USED IN BACKTEST"
+                    ),
+
+                    "institutional_flow": (
+                        "NOT USED IN BACKTEST"
+                    ),
+                },
+
+                "parameters_locked": {
+
+                    "EMA21": EMA_FAST,
+                    "EMA55": EMA_MID,
+                    "EMA100": EMA_LONG,
+                    "EMA200": EMA_TREND,
+
+                    "RSI_PERIOD": RSI_PERIOD,
+                    "RSI_MIN": RSI_MIN,
+                    "RSI_MAX": RSI_MAX,
+
+                    "MACD_FAST": MACD_FAST,
+                    "MACD_SLOW": MACD_SLOW,
+                    "MACD_SIGNAL": MACD_SIGNAL,
+
+                    "ATR_PERIOD": ATR_PERIOD,
+                    "ATR_MULTIPLIER": ATR_MULTIPLIER,
+
+                    "ADX_PERIOD": ADX_PERIOD,
+                    "MIN_ADX": MIN_ADX,
+
+                    "VOLUME_PERIOD": VOLUME_PERIOD,
+                    "MIN_VOLUME_RATIO": MIN_VOLUME_RATIO,
+
+                    "BREAKOUT_PERIOD": BREAKOUT_PERIOD,
+
+                    "MAX_EXTENSION_PCT": (
+                        MAX_EXTENSION_PCT
+                    ),
+
+                    "RISK_PER_TRADE_PCT": (
+                        RISK_PER_TRADE_PCT
+                    ),
+
+                    "REWARD_RISK": (
+                        REWARD_RISK
+                    ),
+
+                    "MAX_HOLDING_DAYS": (
+                        MAX_HOLDING_DAYS
+                    ),
                 },
             },
+
             "trades": trades,
+
+            "equity_curve": equity_curve,
         }
 
         return dump_json(result)
@@ -2327,8 +3531,8 @@ async def backtest(
     except Exception as exc:
 
         logger.exception(
-            "Backtest failed for {}",
-            symbol
+            "Final strategy backtest failed for {}",
+            symbol,
         )
 
         return create_error_response(
